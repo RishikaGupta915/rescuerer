@@ -12,6 +12,14 @@ import cv2
 
 from detection.human_detector import DEFAULT_MODEL_PATH, HumanDetector
 from geo.geo_mapper import GeoMapper
+try:
+    from hardware.ledalert import close_arduino, send_alert
+except Exception as exc:
+    send_alert = None
+    close_arduino = None
+    LED_ALERT_IMPORT_ERROR = exc
+else:
+    LED_ALERT_IMPORT_ERROR = None
 from motion.motion_analyzer import MotionAnalyzer, MotionResult
 from pose.pose_analyzer import PoseAnalyzer, PoseResult
 from tracking.tracker import PersonTracker
@@ -25,6 +33,76 @@ SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 GENERATED_VIDEO_MARKERS = ("phase1_", "phase2_", "phase3_", "_output")
 DEFAULT_GEO_SNAPSHOT = PROJECT_ROOT / "data" / "phase6_geo_snapshot.json"
 DEFAULT_HISTORY_OUTPUT = PROJECT_ROOT / "data" / "pipeline_history.json"
+SEVERITY_PRIORITY = ("HIGH", "MEDIUM", "LOW")
+
+
+def print_pipeline_progress(phase_name: str, processed_frames: int, total_frames: int, started_at: float) -> None:
+    elapsed = max(time.time() - started_at, 0.001)
+    throughput = processed_frames / elapsed
+    if total_frames > 0:
+        percent = min(100.0, (processed_frames / total_frames) * 100)
+        print(
+            f"{phase_name} progress: {processed_frames}/{total_frames} frames "
+            f"({percent:.1f}%) at {throughput:.1f} fps",
+            flush=True,
+        )
+        return
+
+    print(f"{phase_name} progress: {processed_frames} frames at {throughput:.1f} fps", flush=True)
+
+
+def select_alert_level(severity_results) -> str | None:
+    active_levels = {result.severity for result in severity_results}
+    for level in SEVERITY_PRIORITY:
+        if level in active_levels:
+            return level
+    return None
+
+
+class LedAlertController:
+    def __init__(self) -> None:
+        self._enabled = send_alert is not None
+        self._last_level: str | None = None
+        self._warning_printed = False
+
+        if not self._enabled and LED_ALERT_IMPORT_ERROR is not None:
+            print(f"LED alerts unavailable: {LED_ALERT_IMPORT_ERROR}")
+            self._warning_printed = True
+
+    def update(self, severity_results) -> None:
+        desired_level = select_alert_level(severity_results) or "OFF"
+        if desired_level == self._last_level:
+            return
+
+        if not self._enabled:
+            self._last_level = desired_level
+            return
+
+        try:
+            send_alert(desired_level)
+            print(f"Arduino alert -> {desired_level}", flush=True)
+            self._last_level = desired_level
+        except Exception as exc:
+            if not self._warning_printed:
+                print(f"LED alerts unavailable: {exc}")
+                self._warning_printed = True
+            self._enabled = False
+
+    def clear(self) -> None:
+        if not self._enabled or self._last_level == "OFF":
+            self._last_level = "OFF"
+            if close_arduino is not None:
+                close_arduino()
+            return
+
+        try:
+            send_alert("OFF")
+        except Exception:
+            pass
+        finally:
+            if close_arduino is not None:
+                close_arduino()
+        self._last_level = "OFF"
 
 
 def parse_args() -> argparse.Namespace:
@@ -436,6 +514,7 @@ def run_phase_one(args: argparse.Namespace) -> None:
     capture = ensure_video_capture(input_video)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     writer = build_writer(args.output, fps, frame_width, frame_height)
@@ -655,6 +734,7 @@ def run_phase_five(args: argparse.Namespace) -> None:
     motion_analyzer = MotionAnalyzer()
     pose_analyzer = PoseAnalyzer()
     severity_scorer = SeverityScorer()
+    led_alerts = LedAlertController()
     capture = ensure_video_capture(input_video)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
@@ -668,6 +748,8 @@ def run_phase_five(args: argparse.Namespace) -> None:
     seen_track_ids: set[int] = set()
     motion_scores: list[float] = []
     severity_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    started_at = time.time()
+    last_progress_log = started_at
 
     try:
         while True:
@@ -681,6 +763,7 @@ def run_phase_five(args: argparse.Namespace) -> None:
             motion_lookup = {result.track_id: result.movement_score for result in motion_results}
             pose_results = pose_analyzer.analyze(frame, tracks, motion_lookup=motion_lookup)
             severity_results = severity_scorer.score(motion_results, pose_results)
+            led_alerts.update(severity_results)
             draw_severity_results(frame, severity_results)
 
             writer.write(frame)
@@ -688,6 +771,9 @@ def run_phase_five(args: argparse.Namespace) -> None:
             total_detections += len(detections)
             confirmed_tracks += len(tracks)
             seen_track_ids.update(track.track_id for track in tracks)
+            if time.time() - last_progress_log >= 2.0:
+                print_pipeline_progress("Phase 5", processed_frames, total_frames, started_at)
+                last_progress_log = time.time()
 
             for motion_result in motion_results:
                 if motion_result.movement_level != "INITIALIZING":
@@ -704,6 +790,7 @@ def run_phase_five(args: argparse.Namespace) -> None:
         capture.release()
         writer.release()
         pose_analyzer.close()
+        led_alerts.clear()
         cv2.destroyAllWindows()
 
     average_motion = sum(motion_scores) / len(motion_scores) if motion_scores else 0.0
@@ -730,9 +817,11 @@ def run_phase_six(args: argparse.Namespace) -> None:
         medium_threshold=medium_threshold,
     )
     geo_mapper = GeoMapper()
+    led_alerts = LedAlertController()
     capture = ensure_video_capture(input_video)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     temp_output_path = args.output.with_name(f"{args.output.stem}.tmp{args.output.suffix}")
@@ -745,6 +834,8 @@ def run_phase_six(args: argparse.Namespace) -> None:
     severity_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     motion_scores: list[float] = []
     latest_geo_results = []
+    started_at = time.time()
+    last_progress_log = started_at
 
     try:
         while True:
@@ -766,6 +857,7 @@ def run_phase_six(args: argparse.Namespace) -> None:
                 else build_disabled_pose_results(tracks)
             )
             severity_results = severity_scorer.score(motion_results, pose_results)
+            led_alerts.update(severity_results)
             geo_results = geo_mapper.map_results(severity_results, frame_width=frame_width, frame_height=frame_height)
             if geo_results:
                 latest_geo_results = geo_results
@@ -776,6 +868,9 @@ def run_phase_six(args: argparse.Namespace) -> None:
             total_detections += len(detections)
             confirmed_tracks += len(tracks)
             seen_track_ids.update(track.track_id for track in tracks)
+            if time.time() - last_progress_log >= 2.0:
+                print_pipeline_progress("Phase 6", processed_frames, total_frames, started_at)
+                last_progress_log = time.time()
 
             for motion_result in motion_results:
                 if motion_result.movement_level not in {"INITIALIZING", "DISABLED"}:
@@ -793,6 +888,7 @@ def run_phase_six(args: argparse.Namespace) -> None:
         writer.release()
         if pose_analyzer is not None:
             pose_analyzer.close()
+        led_alerts.clear()
         cv2.destroyAllWindows()
 
     finalize_output_video(temp_output_path, args.output)

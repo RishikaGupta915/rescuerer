@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -561,7 +564,7 @@ def render_priority_queue(frame: pd.DataFrame) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def run_pipeline(source_video: Path, settings: dict) -> tuple[bool, dict]:
+def run_pipeline(source_video: Path, settings: dict, progress_callback=None) -> tuple[bool, dict]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_stem = source_video.stem.replace(" ", "_").replace("(", "").replace(")", "")
     output_video = DATA_DIR / f"{PROCESSED_VIDEO_PREFIX}{safe_stem}_{timestamp}.mp4"
@@ -593,16 +596,63 @@ def run_pipeline(source_video: Path, settings: dict) -> tuple[bool, dict]:
 
     env = dict(os.environ)
     env.setdefault("YOLO_CONFIG_DIR", str(PROJECT_ROOT / "Ultralytics"))
-    completed = subprocess.run(
+    env["PYTHONUNBUFFERED"] = "1"
+
+    process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env=env,
+        bufsize=1,
     )
+    output_lines: list[str] = []
+    output_queue: queue.Queue[str] = queue.Queue()
+    started_at = time.time()
 
-    if completed.returncode != 0:
-        return False, {"error": completed.stderr.strip() or completed.stdout.strip() or "Pipeline failed."}
+    def _pump_output() -> None:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            output_queue.put(line.rstrip())
+
+    reader = threading.Thread(target=_pump_output, daemon=True)
+    reader.start()
+
+    while process.poll() is None:
+        elapsed = time.time() - started_at
+        saw_output = False
+        while True:
+            try:
+                line = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            saw_output = True
+            if line:
+                output_lines.append(line)
+                if progress_callback is not None:
+                    progress_callback(line, elapsed)
+        if progress_callback is not None and not saw_output:
+            progress_callback(None, elapsed)
+        time.sleep(0.2)
+
+    reader.join(timeout=1.0)
+    while True:
+        try:
+            line = output_queue.get_nowait()
+        except queue.Empty:
+            break
+        if line:
+            output_lines.append(line)
+            if progress_callback is not None:
+                progress_callback(line, time.time() - started_at)
+
+    return_code = process.wait()
+    output_text = "\n".join(output_lines).strip()
+
+    if return_code != 0:
+        return False, {"error": output_text or "Pipeline failed."}
     return True, {"video": output_video}
 
 
@@ -678,14 +728,27 @@ def render_upload(settings: dict) -> None:
             st.write(f"Pose enabled: `{settings['pose_enabled']}`")
             st.write(f"Motion enabled: `{settings['motion_enabled']}`")
             if st.button("Run Pipeline", type="primary", use_container_width=True):
-                with st.spinner("Processing video..."):
-                    ok, result = run_pipeline(selected_path, settings)
+                status_placeholder = st.empty()
+                logs_placeholder = st.empty()
+                recent_logs: list[str] = []
+
+                def on_progress(line: str | None, elapsed: float) -> None:
+                    status_placeholder.info(
+                        f"Processing video... {int(elapsed)}s elapsed. "
+                        "Please wait while detection and severity scoring run."
+                    )
+                    if line:
+                        recent_logs.append(line)
+                        logs_placeholder.code("\n".join(recent_logs[-8:]), language="text")
+
+                ok, result = run_pipeline(selected_path, settings, progress_callback=on_progress)
                 if ok:
+                    status_placeholder.success("Pipeline completed.")
                     st.session_state["active_processed_video"] = result["video"].name
                     st.session_state["active_page"] = "Dashboard"
-                    st.success("Pipeline completed.")
                     st.rerun()
                 else:
+                    status_placeholder.empty()
                     st.error(result["error"])
     else:
         st.info("No source videos found in the data folder yet.")

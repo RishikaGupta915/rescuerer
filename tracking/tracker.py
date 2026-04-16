@@ -19,7 +19,15 @@ class TrackedPerson:
 
 class PersonTracker:
     def __init__(self, max_age: int = 30, n_init: int = 3) -> None:
-        from deep_sort_realtime.deepsort_tracker import DeepSort
+        try:
+            from deep_sort_realtime.deepsort_tracker import DeepSort
+        except ModuleNotFoundError as exc:
+            if exc.name == "pkg_resources":
+                raise RuntimeError(
+                    "Tracking requires setuptools because deep_sort_realtime imports pkg_resources. "
+                    "Run '.\\venv\\Scripts\\python.exe -m pip install setuptools'."
+                ) from exc
+            raise
 
         self._tracker = DeepSort(max_age=max_age, n_init=n_init)
 
