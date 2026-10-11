@@ -8,6 +8,8 @@ from pose.pose_analyzer import PoseResult
 from tracking.tracker import TrackedPerson
 from triage.severity_scorer import SeverityScorer
 from storage import RunStore
+from fastapi.testclient import TestClient
+from api_server import create_app
 
 
 def make_track(track_id: int = 1) -> TrackedPerson:
@@ -101,3 +103,31 @@ def test_run_store_records_alert_and_audit_lifecycle(tmp_path) -> None:
     assert updated["status"] == "ACKNOWLEDGED"
     assert updated["operator_note"] == "Reviewed evidence"
     assert store.count() == {"runs": 1, "observations": 1, "alerts": 1}
+
+
+def test_run_store_registers_and_updates_sources(tmp_path) -> None:
+    store = RunStore(tmp_path / "rescue_eye.db")
+
+    source = store.register_source("Training camera", "rtsp", "rtsp://camera.local/live")
+    assert source["name"] == "Training camera"
+    assert source["status"] == "registered"
+
+    updated = store.update_source_status(source["source_id"], "online")
+    assert updated["status"] == "online"
+    assert store.list_sources()[0]["source_id"] == source["source_id"]
+
+
+def test_api_exposes_health_sources_and_protected_alerts(tmp_path) -> None:
+    client = TestClient(create_app(tmp_path / "api.db", api_key="test-key"))
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/v1/alerts").status_code == 401
+
+    source_response = client.post(
+        "/api/v1/sources",
+        headers={"X-API-Key": "test-key"},
+        json={"name": "Command camera", "source_type": "local_file", "uri": "data/video.mp4"},
+    )
+    assert source_response.status_code == 201
+    assert source_response.json()["source_type"] == "local_file"
+    assert client.get("/api/v1/sources", headers={"X-API-Key": "test-key"}).json()[0]["name"] == "Command camera"

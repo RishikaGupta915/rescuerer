@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from geo.geo_mapper import GeoResult
 
 ALERT_STATUSES = ("NEW", "ACKNOWLEDGED", "ASSIGNED", "RESOLVED", "DISMISSED")
+SOURCE_TYPES = ("local_file", "rtsp", "webcam")
 
 
 class RunStore:
@@ -39,6 +40,16 @@ class RunStore:
                     geo_output TEXT NOT NULL,
                     geo_mode TEXT NOT NULL,
                     summary_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sources (
+                    source_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    uri TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'registered',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (source_type IN ('local_file', 'rtsp', 'webcam'))
                 );
                 CREATE TABLE IF NOT EXISTS observations (
                     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +156,53 @@ class RunStore:
                     (alert_cursor.lastrowid, "created", None, "NEW", "system", now),
                 )
         return run_id
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, timestamp, input_video, output_video, geo_output, geo_mode, summary_json FROM runs ORDER BY timestamp DESC"
+            ).fetchall()
+        runs = []
+        for row in rows:
+            item = dict(row)
+            item["summary"] = json.loads(item.pop("summary_json"))
+            runs.append(item)
+        return runs
+
+    def register_source(self, name: str, source_type: str, uri: str) -> dict[str, Any]:
+        if source_type not in SOURCE_TYPES:
+            raise ValueError(f"Unsupported source type: {source_type}")
+        source_id = uuid.uuid4().hex
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO sources(source_id, name, source_type, uri, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_id, name, source_type, uri, now, now),
+            )
+        return self.get_source(source_id)  # type: ignore[return-value]
+
+    def list_sources(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute("SELECT * FROM sources ORDER BY created_at DESC").fetchall()]
+
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM sources WHERE source_id = ?", (source_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_source_status(self, source_id: str, status: str) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE sources SET status = ?, updated_at = ? WHERE source_id = ?",
+                (status, now, source_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Source {source_id} does not exist")
+        return self.get_source(source_id)  # type: ignore[return-value]
 
     def list_alerts(self, run_id: str | None = None) -> list[dict[str, Any]]:
         query = """

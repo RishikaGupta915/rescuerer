@@ -12,6 +12,9 @@ pandas
 plotly
 scikit-learn
 pyserial
+fastapi
+uvicorn
+httpx
 
 # Development and validation
 pytest

@@ -113,7 +113,9 @@ Arduino alerts are optional and disabled when the serial dependency or board is 
 - [CPU/GPU and live-input research](docs/cpu.md)
 - [Phase 1 implementation record](docs/phase1.md)
 - [Planning notes](docs/new.md)
+- [Phase 2 implementation record](docs/phase2.md)
+- [Phase 3 implementation record](docs/phase3.md)
 
 ## Scope Boundaries
 
-The system currently supports local recorded video. Multi-camera ingestion, RTSP/phone source adapters, durable incident storage, authenticated users, real geolocation calibration, thermal fusion, field validation, and drone workflows are planned work described in the PRD.
+The system currently supports local recorded video. Phase 3 adds a protected local API and source registry, but RTSP/phone frame ingestion, durable incident users, real geolocation calibration, thermal fusion, field validation, and drone workflows remain planned work described in the PRD.

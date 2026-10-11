@@ -27,6 +27,8 @@ The current project scope does not include drone operations. Drone ingestion and
 
 The first executable target is a Windows CPU-compatible recorded-video workflow. An NVIDIA GPU is an optional acceleration path, not a prerequisite for development, testing, or local MVP operation.
 
+Phase 3 adds a local operational boundary: a FastAPI service, optional API-key protection, source registration, health/metrics endpoints, webhook delivery, and CPU-compatible Docker Compose packaging. It does not yet ingest RTSP frames; source adapters remain the next increment.
+
 ## 3. Product Goals
 
 ### Primary goals
