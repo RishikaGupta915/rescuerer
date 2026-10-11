@@ -17,6 +17,8 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+from storage import ALERT_STATUSES, RunStore
+
 try:
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
@@ -35,6 +37,7 @@ except Exception:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_HISTORY_PATH = DATA_DIR / "pipeline_history.json"
+DEFAULT_DATABASE_PATH = DATA_DIR / "rescue_eye.db"
 DEFAULT_SETTINGS_PATH = DATA_DIR / "dashboard_settings.json"
 SUPPORTED_UPLOAD_EXTENSIONS = ("mp4", "avi", "mov", "mkv", "webm")
 PROCESSED_VIDEO_PREFIX = "phase6_geo_output_"
@@ -539,8 +542,50 @@ def build_priority_queue(frame: pd.DataFrame) -> pd.DataFrame:
     return queue
 
 
-def render_priority_queue(frame: pd.DataFrame) -> None:
+def render_priority_queue(frame: pd.DataFrame, store: RunStore) -> None:
     st.subheader("Priority Queue")
+    try:
+        alerts = store.list_alerts()
+    except Exception as exc:
+        st.error(f"Alert database unavailable: {exc}")
+        alerts = []
+
+    if alerts:
+        for alert in alerts[:8]:
+            status = alert["status"]
+            label = f"Alert {alert['alert_id']} - Victim {alert['track_id']} - {alert['severity']}"
+            with st.expander(f"{label} ({status})", expanded=status in {"NEW", "ACKNOWLEDGED"}):
+                st.write(
+                    f"Posture: {alert['posture']} | Movement: {alert['movement_level']} | "
+                    f"Confidence: {alert['confidence']:.2f}"
+                )
+                st.caption(f"Evidence: {alert['evidence_ref']} | Location mode: {alert['location_mode']}")
+                next_status = st.selectbox(
+                    "Alert status",
+                    ALERT_STATUSES,
+                    index=ALERT_STATUSES.index(status),
+                    key=f"alert_status_{alert['alert_id']}",
+                )
+                note = st.text_input(
+                    "Operator note",
+                    value=alert["operator_note"] or "",
+                    key=f"alert_note_{alert['alert_id']}",
+                )
+                if st.button("Save Alert", key=f"save_alert_{alert['alert_id']}"):
+                    try:
+                        store.update_alert(
+                            alert["alert_id"],
+                            next_status,
+                            actor="dashboard_operator",
+                            note=note or None,
+                        )
+                        st.success("Alert updated.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not update alert: {exc}")
+    else:
+        st.info("No persisted alerts yet.")
+
     queue = build_priority_queue(frame)
     if queue.empty:
         st.info("Priority queue will appear after a victim-positive run.")
@@ -656,7 +701,13 @@ def run_pipeline(source_video: Path, settings: dict, progress_callback=None) -> 
     return True, {"video": output_video}
 
 
-def render_dashboard(frame: pd.DataFrame, source_video: Path | None, processed_video: Path | None, active_row: pd.Series | None) -> None:
+def render_dashboard(
+    frame: pd.DataFrame,
+    source_video: Path | None,
+    processed_video: Path | None,
+    active_row: pd.Series | None,
+    store: RunStore,
+) -> None:
     render_header(active_row)
 
     metrics = st.columns(4)
@@ -695,7 +746,7 @@ def render_dashboard(frame: pd.DataFrame, source_video: Path | None, processed_v
 
     queue_col, info_col = st.columns([1.0, 1.0])
     with queue_col:
-        render_priority_queue(frame)
+        render_priority_queue(frame, store)
     with info_col:
         st.subheader("Overlay Legend")
         st.write("RED -> HIGH")
@@ -848,7 +899,8 @@ def render_victims(frame: pd.DataFrame, active_row: pd.Series | None) -> None:
 def render_map(frame: pd.DataFrame, active_row: pd.Series | None) -> None:
     render_header(active_row)
     st.subheader("Victim Map")
-    st.caption("Coordinates are still simulated, but they come from the active run output and are not hardcoded page values.")
+    location_modes = sorted(set(frame["location_mode"].dropna())) if "location_mode" in frame.columns else ["demo"]
+    st.caption(f"Location provenance: {', '.join(location_modes)}. Demo coordinates are not exact victim locations.")
     components.html(build_map(frame), height=650)
 
 
@@ -921,6 +973,12 @@ def render_settings(settings: dict) -> None:
 inject_styles()
 settings = load_settings(DEFAULT_SETTINGS_PATH)
 history = load_run_history(DEFAULT_HISTORY_PATH)
+try:
+    run_store = RunStore(DEFAULT_DATABASE_PATH)
+    database_error = None
+except Exception as exc:
+    run_store = None
+    database_error = exc
 processed_runs = valid_processed_outputs(history)
 processed_names = [path.name for path in processed_runs]
 
@@ -947,6 +1005,8 @@ with st.sidebar:
     if processed_names:
         st.session_state["active_processed_video"] = selected_name
     st.caption(f"Conf {settings['confidence_threshold']:.2f} - Sens {settings['severity_sensitivity']:.2f}")
+    if database_error is not None:
+        st.error(f"Local alert database unavailable: {database_error}")
 
 selected_video = DATA_DIR / st.session_state["active_processed_video"] if st.session_state.get("active_processed_video") else None
 active_row = row_for_output(history, selected_video)
@@ -955,7 +1015,10 @@ geo_snapshot = resolve_path(active_row.get("geo_output")) if active_row is not N
 snapshot = load_geo_snapshot(geo_snapshot)
 
 if page == "Dashboard":
-    render_dashboard(snapshot, source_video, selected_video, active_row)
+    if run_store is None:
+        st.error("The dashboard cannot manage alerts until the local SQLite database is available.")
+    else:
+        render_dashboard(snapshot, source_video, selected_video, active_row, run_store)
 elif page == "Upload":
     render_upload(settings)
 elif page == "Analysis":

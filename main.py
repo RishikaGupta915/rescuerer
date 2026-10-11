@@ -22,6 +22,7 @@ else:
     LED_ALERT_IMPORT_ERROR = None
 from motion.motion_analyzer import MotionAnalyzer, MotionResult
 from pose.pose_analyzer import PoseAnalyzer, PoseResult
+from storage import RunStore
 from tracking.tracker import PersonTracker
 from triage.severity_scorer import SeverityScorer
 
@@ -33,6 +34,7 @@ SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 GENERATED_VIDEO_MARKERS = ("phase1_", "phase2_", "phase3_", "_output")
 DEFAULT_GEO_SNAPSHOT = PROJECT_ROOT / "data" / "phase6_geo_snapshot.json"
 DEFAULT_HISTORY_OUTPUT = PROJECT_ROOT / "data" / "pipeline_history.json"
+DEFAULT_DATABASE_OUTPUT = PROJECT_ROOT / "data" / "rescue_eye.db"
 SEVERITY_PRIORITY = ("HIGH", "MEDIUM", "LOW")
 
 
@@ -143,6 +145,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_HISTORY_OUTPUT,
         help="Path to append run history as JSON.",
+    )
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=DEFAULT_DATABASE_OUTPUT,
+        help="Path to the local SQLite run and alert database.",
+    )
+    parser.add_argument(
+        "--geo-mode",
+        choices=["demo", "calibrated", "gps"],
+        default="demo",
+        help="Provenance label for coordinates. Only demo mapping is implemented in this phase.",
     )
     parser.add_argument(
         "--severity-sensitivity",
@@ -816,7 +830,9 @@ def run_phase_six(args: argparse.Namespace) -> None:
         high_threshold=args.severity_sensitivity,
         medium_threshold=medium_threshold,
     )
-    geo_mapper = GeoMapper()
+    if args.geo_mode != "demo":
+        raise ValueError("calibrated and gps geo modes are reserved for a future phase")
+    geo_mapper = GeoMapper(location_mode=args.geo_mode)
     led_alerts = LedAlertController()
     capture = ensure_video_capture(input_video)
 
@@ -900,6 +916,8 @@ def run_phase_six(args: argparse.Namespace) -> None:
         "input_video": str(input_video),
         "output_video": str(args.output),
         "geo_output": str(args.geo_output),
+        "geo_mode": args.geo_mode,
+        "database": str(args.database),
         "confidence_threshold": args.conf,
         "severity_sensitivity": args.severity_sensitivity,
         "pose_enabled": not args.disable_pose,
@@ -915,6 +933,7 @@ def run_phase_six(args: argparse.Namespace) -> None:
         "active_geo_victims": len(latest_geo_results),
     }
     append_run_history(args.history_output, summary)
+    run_id = RunStore(args.database).record_run(summary, latest_geo_results)
 
     print(f"Processed {processed_frames} frames.")
     print(f"Detected {total_detections} people across all frames.")
@@ -927,6 +946,7 @@ def run_phase_six(args: argparse.Namespace) -> None:
     print(f"Saved annotated video to: {args.output}")
     print(f"Saved geo snapshot to: {args.geo_output}")
     print(f"Saved run history to: {args.history_output}")
+    print(f"Saved run {run_id} and alerts to: {args.database}")
 
 
 def main() -> None:

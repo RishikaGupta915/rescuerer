@@ -72,8 +72,11 @@ The normal Phase 6 run writes the following by default:
 - Annotated output video: `data/phase1_detection_output.mp4`
 - Geo snapshot: `data/phase6_geo_snapshot.json`
 - Recent run history: `data/pipeline_history.json`
+- Local Phase 2 database: `data/rescue_eye.db`
 
 Coordinates in the current output are simulated projections from image coordinates. They must not be treated as exact victim locations.
+
+Phase 2 stores each completed Phase 6 run, its latest victim observations, and generated alerts in SQLite. The JSON files remain export and dashboard compatibility artifacts. Alert statuses are `NEW`, `ACKNOWLEDGED`, `ASSIGNED`, `RESOLVED`, and `DISMISSED`; status changes are recorded in the database audit table.
 
 ## Run The Dashboard
 

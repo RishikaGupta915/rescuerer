@@ -48,6 +48,7 @@ flowchart TD
     POSE --> SCORE[Phase 5: Severity Scorer]
     SCORE --> GEO[Phase 6: Geo Mapper]
     GEO --> OUTPUT[Annotated Output Video + Geo JSON]
+    GEO --> STORE[SQLite Run, Observation, Alert Store]
 
     %% Style notes
     classDef cv fill:#e3f2fd,stroke:#1976d2,stroke-width:2px;
@@ -74,7 +75,7 @@ flowchart TD
 | **Severity Scorer** | Rule‑based fusion of motion + posture thresholds | `severity` (`HIGH`/`MEDIUM`/`LOW`) + `severity_score` |
 | **Geo Mapper** | Projects bounding‑box center to a simulated lat/lon grid | `GeoResult` per victim, written to JSON snapshot |
 
-The pipeline can be **selectively disabled** per‑phase via CLI flags (`--disable-pose`, `--disable-motion`), which substitute identity‑preserving placeholders (e.g., `UNKNOWN` posture, `DISABLED` motion).
+The pipeline can be **selectively disabled** per-phase via CLI flags (`--disable-pose`, `--disable-motion`), which substitute identity-preserving placeholders (e.g., `UNKNOWN` posture, `DISABLED` motion). Phase 6 records completed runs and the latest geo observations in the local SQLite store at `data/rescue_eye.db`. The store creates a `NEW` alert for each persisted victim observation and retains operator status transitions in an audit table.
 
 ---
 
@@ -83,6 +84,7 @@ The pipeline can be **selectively disabled** per‑phase via CLI flags (`--disab
 - **Run a specific phase**: `python main.py --phase phase1` through `--phase phase6`.
 - **Toggle components**: `--disable-pose` / `--disable-motion`.
 - **Inspect intermediate results**: The pipeline writes a history JSON (`--history-output`) and a geo snapshot (`--geo-output`); both contain the internal data‑structure payloads described above.
+- **Inspect intermediate results**: The pipeline writes a history JSON (`--history-output`), a geo snapshot (`--geo-output`), and a SQLite run/alert database (`--database`).
 - **Swap models**: Replace the YOLO weights (`models/yolov8n.pt`) or provide a custom `--weights` path; the `HumanDetector` class loads any Ultralytics‑compatible `.pt` file.
 
 ---
@@ -96,4 +98,5 @@ The pipeline can be **selectively disabled** per‑phase via CLI flags (`--disab
 | `pose/pose_analyzer.py` | `PoseResult` dataclass + `PoseAnalyzer` (MediaPipe) |
 | `triage/severity_scorer.py` | Severity scoring logic (not fully read, but referenced in `main.py`) |
 | `geo/geo_mapper.py` | Geo‑mapping logic + snapshot writer |
+| `storage.py` | SQLite run, observation, alert, and audit persistence |
 | `main.py` | Orchestrates the six phases; contains `draw_*` helpers for visualization |

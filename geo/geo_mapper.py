@@ -20,6 +20,7 @@ class GeoResult:
     movement_score: float
     latitude: float
     longitude: float
+    location_mode: str
     confidence: float
     rationale: str
     x1: int
@@ -35,11 +36,15 @@ class GeoMapper:
         base_longitude: float = 77.5946,
         latitude_span: float = 0.01,
         longitude_span: float = 0.01,
+        location_mode: str = "demo",
     ) -> None:
+        if location_mode not in {"demo", "calibrated", "gps"}:
+            raise ValueError("location_mode must be demo, calibrated, or gps")
         self.base_latitude = base_latitude
         self.base_longitude = base_longitude
         self.latitude_span = latitude_span
         self.longitude_span = longitude_span
+        self.location_mode = location_mode
 
     def map_results(
         self,
@@ -71,6 +76,7 @@ class GeoMapper:
                     movement_score=result.movement_score,
                     latitude=round(latitude, 6),
                     longitude=round(longitude, 6),
+                    location_mode=self.location_mode,
                     confidence=result.detection_confidence,
                     rationale=result.rationale,
                     x1=result.x1,
