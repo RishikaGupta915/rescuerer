@@ -1,0 +1,17 @@
+# Runtime dependencies for the current local video pipeline and Streamlit dashboard.
+# Keep this file installable on the supported Windows Python version.
+
+numpy
+opencv-python
+ultralytics
+deep-sort-realtime
+mediapipe
+streamlit
+folium
+pandas
+plotly
+scikit-learn
+pyserial
+
+# Development and validation
+pytest

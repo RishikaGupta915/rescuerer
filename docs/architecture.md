@@ -30,7 +30,7 @@ The pipeline does not train on a custom dataset; it uses a **pretrained YOLO‑v
 5. **Phase 5** – `SeverityScorer` combines `motion_score` and `pose_result.posture` into a final severity (`HIGH`/ `MEDIUM`/`LOW`).
 6. **Phase 6** – `GeoMapper` projects each victim’s bounding box to a simulated geographic point and writes a JSON snapshot.
 
-All structures are **plain Python dataclasses** (frozen via `slots=True`) so they can be serialized to JSON for history tracking or further downstream processing.
+All structures are **plain Python dataclasses** using `slots=True`, so they can be serialized to JSON for history tracking or further downstream processing. They are not immutable: later persistence work must define which fields are append-only or versioned.
 
 ---
 
