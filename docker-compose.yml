@@ -24,3 +24,13 @@ services:
       - ./data:/app/data
       - ./models:/app/models
       - ./Ultralytics:/app/Ultralytics
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

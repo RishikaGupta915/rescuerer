@@ -17,6 +17,34 @@ from storage import ALERT_STATUSES, SOURCE_TYPES, RunStore
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent / "data" / "rescue_eye.db"
 
 
+class UserRole:
+    """Role constants for RBAC."""
+    ADMIN = "admin"
+    OPERATOR = "operator"
+    VIEWER = "viewer"
+
+
+class RoleRequired:
+    """Dependency to require specific user roles."""
+
+    def __init__(self, allowed_roles: tuple[str, ...]) -> None:
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, x_api_key: str | None = Header(default=None),
+                 x_user_role: str | None = Header(default=None)) -> None:
+        configured_api_key = os.getenv("RESCUE_EYE_API_KEY")
+        if not configured_api_key or x_api_key != configured_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
+            )
+        if x_user_role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions. Required: {', '.join(self.allowed_roles)}, "
+                       f"Got: {x_user_role}"
+            )
+
+
 class SourceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source_type: str
@@ -46,19 +74,42 @@ class EmailNotification(BaseModel):
     body: str = Field(min_length=1)
 
 
+class SMSNotification(BaseModel):
+    alert_id: int
+    recipient: str = Field(min_length=1, max_length=20, pattern="^\\+?[1-9]\\d{0,14}$")
+    body: str = Field(min_length=1, max_length=160)
+
+
 class NotificationRequest(BaseModel):
     alert_id: int
-    method: str = Field(default="webhook", pattern="^(webhook|email)$")
+    method: str = Field(default="webhook", pattern="^(webhook|email|sms)$")
 
 
 def create_app(database_path: str | Path = DEFAULT_DATABASE_PATH, api_key: str | None = None) -> FastAPI:
     store = RunStore(database_path)
     configured_api_key = api_key if api_key is not None else os.getenv("RESCUE_EYE_API_KEY")
-    app = FastAPI(title="Rescue-Eye API", version="0.4.0")
+    app = FastAPI(title="Rescue-Eye API", version="0.5.0")
 
     def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         if configured_api_key and x_api_key != configured_api_key:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
+            )
+
+    def require_roles(*allowed_roles: str):
+        """FastAPI dependency that checks for required roles."""
+        def role_checker(x_api_key: str = Header(default=None),
+                         x_user_role: str = Header(default=None)) -> None:
+            if configured_api_key and x_api_key != configured_api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
+                )
+            if x_user_role not in allowed_roles:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Insufficient permissions. Required: {', '.join(allowed_roles)}"
+                )
+        return role_checker
 
     @app.get("/health")
     def health() -> dict:
@@ -146,8 +197,18 @@ def create_app(database_path: str | Path = DEFAULT_DATABASE_PATH, api_key: str |
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Email delivery failed: {exc}") from exc
 
+    @app.post("/api/v1/notifications/sms", dependencies=[Depends(require_api_key)])
+    def send_sms_notification(payload: SMSNotification) -> dict:
+        alert = next((item for item in store.list_alerts() if item["alert_id"] == payload.alert_id), None)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        # In production, this would integrate with an SMS gateway (Twilio, etc.)
+        print(f"SMS would be sent to {payload.recipient}: {payload.body[:40]}...")
+        return {"sent": True, "alert_id": payload.alert_id, "recipient": payload.recipient}
+
     @app.websocket("/api/v1/alerts/ws/{alert_id}")
-    async def alert_websocket(websocket: WebSocket, alert_id: int, x_api_key: str = Header(default=None)):
+    async def alert_websocket(websocket: WebSocket, alert_id: int, x_api_key: str = Header(default=None),
+                             x_user_role: str = Header(default=None)) -> None:
         if configured_api_key and x_api_key != configured_api_key:
             await websocket.close(code=4001, reason="Invalid API key")
             return

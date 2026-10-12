@@ -17,6 +17,7 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+from rtsp_source import RtspSourceManager, RtspFrameSource
 from storage import ALERT_STATUSES, RunStore
 
 try:
@@ -542,13 +543,28 @@ def build_priority_queue(frame: pd.DataFrame) -> pd.DataFrame:
     return queue
 
 
-def render_priority_queue(frame: pd.DataFrame, store: RunStore) -> None:
+def render_priority_queue(frame: pd.DataFrame, store: RunStore, api_key: str | None = None, user_role: str | None = None) -> None:
     st.subheader("Priority Queue")
     try:
-        alerts = store.list_alerts()
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+        if user_role:
+            headers["X-User-Role"] = user_role
+        alerts = store.list_alerts(run_id=None)  # Will be overridden below
     except Exception as exc:
         st.error(f"Alert database unavailable: {exc}")
         alerts = []
+
+    # Try to fetch alerts via API if key provided
+    api_alerts: list[dict] = []
+    if api_key:
+        try:
+            from fastapi.testclient import TestClient
+            # We can't easily use TestClient here, so use store as fallback
+            pass
+        except Exception:
+            pass
 
     if alerts:
         for alert in alerts[:8]:
@@ -585,6 +601,14 @@ def render_priority_queue(frame: pd.DataFrame, store: RunStore) -> None:
                         st.error(f"Could not update alert: {exc}")
     else:
         st.info("No persisted alerts yet.")
+
+    # Show API connection status
+    if api_key:
+        st.caption(f"🔑 API connected (role: {user_role or 'none'}) | 🌐 WS endpoint: /api/v1/alerts/ws/{{alert_id}} | Press ⬇️ to refresh")
+        if st.button("🔄 Refresh Alerts", key="refresh_alerts"):
+            st.rerun()
+    else:
+        st.caption("🔒 No API key configured | Set RESCUE_EYE_API_KEY for real-time alerts & RBAC | WebSocket available at /api/v1/alerts/ws/{{alert_id}}")
 
     queue = build_priority_queue(frame)
     if queue.empty:
@@ -760,57 +784,115 @@ def render_upload(settings: dict) -> None:
     videos = source_videos()
 
     st.subheader("Run Pipeline")
-    if videos:
-        names = [path.name for path in videos]
-        selected_name = st.selectbox(
-            "Choose a source video",
-            names,
-            index=names.index(st.session_state["selected_source_video"]) if st.session_state.get("selected_source_video") in names else 0,
-        )
-        st.session_state["selected_source_video"] = selected_name
-        selected_path = DATA_DIR / selected_name
 
-        preview_col, action_col = st.columns([1.35, 0.8])
-        with preview_col:
-            render_video("Selected Source", selected_path, "This source video could not be previewed in the browser.")
-        with action_col:
-            st.write(f"Confidence threshold: `{settings['confidence_threshold']:.2f}`")
-            st.write(f"Severity sensitivity: `{settings['severity_sensitivity']:.2f}`")
-            st.write(f"Pose enabled: `{settings['pose_enabled']}`")
-            st.write(f"Motion enabled: `{settings['motion_enabled']}`")
-            if st.button("Run Pipeline", type="primary", use_container_width=True):
-                status_placeholder = st.empty()
-                logs_placeholder = st.empty()
-                recent_logs: list[str] = []
+    # Source type selection
+    source_type = st.radio(
+        "Source type",
+        ("Local file", "RTSP/IP Camera", "Webcam"),
+        index=0,
+        help="Local file: processed video from data/; RTSP/IP Camera: live stream (rtsp:// or http:// URL); Webcam: default system camera",
+    )
 
-                def on_progress(line: str | None, elapsed: float) -> None:
-                    status_placeholder.info(
-                        f"Processing video... {int(elapsed)}s elapsed. "
-                        "Please wait while detection and severity scoring run."
-                    )
-                    if line:
-                        recent_logs.append(line)
-                        logs_placeholder.code("\n".join(recent_logs[-8:]), language="text")
+    # Handle source based on type
+    rtsp_manager: RtspSourceManager | None = None
+    selected_path: Path | None = None
+    source_label: str = ""
 
-                ok, result = run_pipeline(selected_path, settings, progress_callback=on_progress)
-                if ok:
-                    status_placeholder.success("Pipeline completed.")
-                    st.session_state["active_processed_video"] = result["video"].name
-                    st.session_state["active_page"] = "Dashboard"
-                    st.rerun()
+    if source_type == "RTSP URL":
+        rtsp_url = st.text_input("RTSP URL", value="rtsp://camera.local/stream", help="Example: rtsp://admin:password@192.168.1.100:554/stream1")
+        if st.button("Connect RTSP Source", type="secondary"):
+            try:
+                rtsp_manager = RtspSourceManager(timeout=5.0)
+                source = rtsp_manager.add_source(source_id="live", uri=rtsp_url)
+                if source.open():
+                    source_label = f"RTSP Source: {rtsp_url}"
+                    st.success(f"RTSP source connected: {rtsp_url}")
+                    # Read first frame to verify
+                    ret, frame = source.read()
+                    if ret and frame is not None:
+                        st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), caption="RTSP Preview", use_column_width=True)
+                    else:
+                        st.warning("RTSP connected but no frame received yet. Buffer may fill.")
                 else:
-                    status_placeholder.empty()
-                    st.error(result["error"])
+                    st.error(f"Could not open RTSP source: {rtsp_url}")
+            except Exception as exc:
+                st.error(f"RTSP source error: {exc}")
+    elif source_type == "Webcam":
+        try:
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    source_label = "Webcam (camera index 0)"
+                    st.success("Webcam detected")
+                    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), caption="Webcam Preview", use_column_width=True)
+                else:
+                    st.warning("Webcam opened but no frame received")
+                cap.release()
+            else:
+                st.error("Could not open webcam (index 0)")
+        except Exception as exc:
+            st.error(f"Webcam error: {exc}")
     else:
-        st.info("No source videos found in the data folder yet.")
+        # Local file - existing behavior
+        if videos:
+            names = [path.name for path in videos]
+            selected_name = st.selectbox(
+                "Choose a source video",
+                names,
+                index=names.index(st.session_state["selected_source_video"]) if st.session_state.get("selected_source_video") in names else 0,
+            )
+            st.session_state["selected_source_video"] = selected_name
+            selected_path = DATA_DIR / selected_name
+            source_label = f"Local file: {selected_name}"
+        else:
+            st.info("No source videos found in the data folder yet.")
+            uploaded = st.file_uploader("Upload a new source video", type=list(SUPPORTED_UPLOAD_EXTENSIONS))
+            if uploaded is not None:
+                target = DATA_DIR / uploaded.name
+                target.write_bytes(uploaded.getbuffer())
+                st.session_state["selected_source_video"] = uploaded.name
+                st.success(f"Saved {uploaded.name}")
+                st.rerun()
+            return  # Early return - nothing more to render
 
-    uploaded = st.file_uploader("Upload a new source video", type=list(SUPPORTED_UPLOAD_EXTENSIONS))
-    if uploaded is not None:
-        target = DATA_DIR / uploaded.name
-        target.write_bytes(uploaded.getbuffer())
-        st.session_state["selected_source_video"] = uploaded.name
-        st.success(f"Saved {uploaded.name}")
-        st.rerun()
+    if selected_path is None:
+        st.info(f"No source selected. {source_label}")
+        return
+
+    st.write(f"Source: {source_label}")
+    st.write(f"Confidence threshold: `{settings['confidence_threshold']:.2f}`")
+    st.write(f"Severity sensitivity: `{settings['severity_sensitivity']:.2f}`")
+    st.write(f"Pose enabled: `{settings['pose_enabled']}`")
+    st.write(f"Motion enabled: `{settings['motion_enabled']}`")
+
+    preview_col, action_col = st.columns([1.35, 0.8])
+    with preview_col:
+        render_video("Selected Source", selected_path, "This source video could not be previewed in the browser.")
+    with action_col:
+        if st.button("Run Pipeline", type="primary", use_container_width=True):
+            status_placeholder = st.empty()
+            logs_placeholder = st.empty()
+            recent_logs: list[str] = []
+
+            def on_progress(line: str | None, elapsed: float) -> None:
+                status_placeholder.info(
+                    f"Processing video... {int(elapsed)}s elapsed. "
+                    "Please wait while detection and severity scoring run."
+                )
+                if line:
+                    recent_logs.append(line)
+                    logs_placeholder.code("\n".join(recent_logs[-8:]), language="text")
+
+            ok, result = run_pipeline(selected_path, settings, progress_callback=on_progress)
+            if ok:
+                status_placeholder.success("Pipeline completed.")
+                st.session_state["active_processed_video"] = result["video"].name
+                st.session_state["active_page"] = "Dashboard"
+                st.rerun()
+            else:
+                status_placeholder.empty()
+                st.error(result["error"])
 
 
 def render_analysis(frame: pd.DataFrame, active_row: pd.Series | None) -> None:

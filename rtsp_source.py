@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,12 +16,16 @@ class RtspSourceError(RuntimeError):
 
 
 class RtspFrameSource:
-    """Manages an RTSP video source frame capture with reconnect logic.
+    """Manages an RTSP video source frame capture with reconnect logic and store-and-forward buffering.
 
     Handles RTSP stream connection, frame retrieval, status tracking,
     and automatic reconnect on failure. Uses OpenCV VideoCapture under
     the hood, which supports RTSP/RTSP URLs with ffmpeg or gstreamer backends.
+    Includes a circular buffer for store-and-forward support: when the stream
+    is temporarily lost, recent frames can be served from the buffer.
     """
+
+    BUFFER_CAPACITY = 30  # Store up to 30 frames (~1 second at 30fps)
 
     def __init__(
         self,
@@ -38,6 +44,9 @@ class RtspFrameSource:
         self._consecutive_failures: int = 0
         self._last_status: str = "initialized"
         self._last_frame_time: float = 0.0
+        # Store-and-forward buffer: recent frames when stream is live
+        self._buffer: deque[tuple[float, Any]] = deque(maxlen=self.BUFFER_CAPACITY)
+        self._buffer_enabled: bool = True
 
     def open(self) -> bool:
         """Open the RTSP stream connection.
@@ -59,6 +68,7 @@ class RtspFrameSource:
                     self._is_open = True
                     self._consecutive_failures = 0
                     self._last_status = "opened"
+                    self._buffer.clear()
                     print(f"RTSP source opened with backend {backend}: {self.uri}")
                     return True
             # If no specific backend worked, try default
@@ -66,6 +76,7 @@ class RtspFrameSource:
                 self._is_open = True
                 self._consecutive_failures = 0
                 self._last_status = "opened"
+                self._buffer.clear()
                 print(f"RTSP source opened: {self.uri}")
                 return True
             self._release()
@@ -87,10 +98,19 @@ class RtspFrameSource:
     def read(self) -> Tuple[bool, Any]:
         """Read a frame from the RTSP stream.
 
+        Uses store-and-forward buffering: if the stream is temporarily
+        unavailable, the most recent buffered frame is returned.
+
         Returns:
             (ret, frame) tuple where ret indicates if frame was read successfully.
         """
         if not self.is_open():
+            # Try to serve from buffer if stream is down
+            if self._buffer and self._buffer_enabled:
+                timestamp, frame = self._buffer[-1]
+                self._consecutive_failures += 1
+                self._last_status = "buffering"
+                return True, frame
             return False, None
 
         try:
@@ -102,15 +122,25 @@ class RtspFrameSource:
                 self._frame_count += 1
                 self._consecutive_failures = 0
                 self._last_frame_time = read_time
+                # Add to buffer (store-and-forward)
+                self._buffer.append((time.time(), frame))
                 return True, frame
             else:
                 self._consecutive_failures += 1
+                # Store buffer last-known frame before stream loss
+                if self._buffer_enabled and self._buffer:
+                    self._buffer.append((time.time(), self._buffer[-1][1]))
                 self._last_status = "stream_lost"
+                # Return buffered frame if available, otherwise None
+                if self._buffer:
+                    return True, self._buffer[-1][1]
                 return False, None
         except Exception as exc:
             self._consecutive_failures += 1
             self._last_status = "error"
             print(f"RTSP read error: {exc}")
+            if self._buffer_enabled and self._buffer:
+                return True, self._buffer[-1][1]
             return False, None
 
     def release(self) -> None:
@@ -125,6 +155,8 @@ class RtspFrameSource:
             "status": self._last_status,
             "frame_count": self._frame_count,
             "consecutive_failures": self._consecutive_failures,
+            "buffer_size": len(self._buffer),
+            "buffer_enabled": self._buffer_enabled,
             "last_frame_time": round(self._last_frame_time, 3),
         }
 
@@ -137,13 +169,21 @@ class RtspFrameSource:
     def reset_failure_count(self) -> None:
         self._consecutive_failures = 0
 
+    def enable_buffer(self, enabled: bool = True) -> None:
+        """Enable or disable store-and-forward buffering.
+
+        When enabled, recent frames are buffered and can be served
+        if the RTSP stream temporarily becomes unavailable.
+        """
+        self._buffer_enabled = enabled
+
 
 class RtspSourceManager:
     """Manages RTSP sources for the Rescue-Eye pipeline.
 
     Handles multiple RTSP streams, their lifecycle, status tracking,
     and frame delivery to the pipeline. Each source is independently
-    managed with its own reconnect logic.
+    managed with its own reconnect logic and store-and-forward buffering.
     """
 
     def __init__(self, timeout: float = 5.0, reconnect_delay: float = 2.0) -> None:
@@ -175,6 +215,7 @@ class RtspSourceManager:
         """Update all sources: read frames, handle reconnects.
 
         Returns a dict mapping source_id to (success, frame) results.
+        Includes store-and-forward buffer status.
         """
         results: Dict[str, Dict[str, Any]] = {}
         for source_id, source in self._sources.items():
