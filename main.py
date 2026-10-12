@@ -22,6 +22,7 @@ else:
     LED_ALERT_IMPORT_ERROR = None
 from motion.motion_analyzer import MotionAnalyzer, MotionResult
 from pose.pose_analyzer import PoseAnalyzer, PoseResult
+from rtsp_source import RtspSourceManager, RtspFrameSource, SOURCE_TYPE_RTSP
 from storage import RunStore
 from tracking.tracker import PersonTracker
 from triage.severity_scorer import SeverityScorer
@@ -324,7 +325,15 @@ def draw_geo_results(frame, geo_results) -> None:
         )
 
 
-def resolve_input_video(requested_path: Path) -> Path:
+def resolve_input_video(requested_path: Path | str) -> Path | str:
+    # Convert string to Path for path operations, but keep RTSP URLs as strings
+    path_str = str(requested_path)
+    # Check if it's an RTSP URL (starts with rtsp://)
+    if path_str.startswith("rtsp://"):
+        print(f"Using RTSP source: {path_str}")
+        return path_str
+
+    requested_path = Path(requested_path) if not path_str.startswith("rtsp://") else requested_path
     if requested_path.exists():
         return requested_path
 
@@ -379,12 +388,26 @@ def print_setup_status(args: argparse.Namespace) -> bool:
     return False
 
 
-def ensure_video_capture(video_path: Path) -> cv2.VideoCapture:
-    capture = cv2.VideoCapture(str(video_path))
+def ensure_video_capture(video_path: Path, source_manager: RtspSourceManager | None = None) -> cv2.VideoCapture | RtspFrameSource:
+    """Create a video capture for the given path.
 
-    if not capture.isOpened():
-        raise RuntimeError(f"OpenCV could not open the input video at '{video_path}'.")
-    return capture
+    For RTSP URLs, returns an RtspFrameSource from the manager.
+    For local files, returns an OpenCV VideoCapture.
+    """
+    requested_path = str(video_path)
+    if requested_path.startswith("rtsp://"):
+        if source_manager is None:
+            source = RtspFrameSource(uri=requested_path)
+        else:
+            source = source_manager.add_source(uri=requested_path)
+        if not source.open():
+            raise RuntimeError(f"OpenCV could not open the RTSP stream at '{requested_path}'.")
+        return source
+    else:
+        capture = cv2.VideoCapture(requested_path)
+        if not capture.isOpened():
+            raise RuntimeError(f"OpenCV could not open the input video at '{video_path}'.")
+        return capture
 
 
 def build_writer(output_path: Path, fps: float, frame_width: int, frame_height: int) -> cv2.VideoWriter:
@@ -525,7 +548,13 @@ def append_run_history(history_path: Path, entry: dict) -> None:
 def run_phase_one(args: argparse.Namespace) -> None:
     input_video = resolve_input_video(args.input)
     detector = HumanDetector(model_path=args.weights, confidence_threshold=args.conf)
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager setup
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+
+    capture = ensure_video_capture(input_video, rtsp_manager)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -567,7 +596,13 @@ def run_phase_two(args: argparse.Namespace) -> None:
     input_video = resolve_input_video(args.input)
     detector = HumanDetector(model_path=args.weights, confidence_threshold=args.conf)
     tracker = PersonTracker()
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager setup
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+
+    capture = ensure_video_capture(input_video, rtsp_manager)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -616,7 +651,13 @@ def run_phase_three(args: argparse.Namespace) -> None:
     detector = HumanDetector(model_path=args.weights, confidence_threshold=args.conf)
     tracker = PersonTracker()
     motion_analyzer = MotionAnalyzer()
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager setup
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+
+    capture = ensure_video_capture(input_video, rtsp_manager)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -678,7 +719,13 @@ def run_phase_four(args: argparse.Namespace) -> None:
     tracker = PersonTracker()
     motion_analyzer = MotionAnalyzer()
     pose_analyzer = PoseAnalyzer()
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager setup
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+
+    capture = ensure_video_capture(input_video, rtsp_manager)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -749,7 +796,13 @@ def run_phase_five(args: argparse.Namespace) -> None:
     pose_analyzer = PoseAnalyzer()
     severity_scorer = SeverityScorer()
     led_alerts = LedAlertController()
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager setup
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+
+    capture = ensure_video_capture(input_video, rtsp_manager)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -834,7 +887,14 @@ def run_phase_six(args: argparse.Namespace) -> None:
         raise ValueError("calibrated and gps geo modes are reserved for a future phase")
     geo_mapper = GeoMapper(location_mode=args.geo_mode)
     led_alerts = LedAlertController()
-    capture = ensure_video_capture(input_video)
+
+    # RTSP source manager for RTSP URLs
+    rtsp_manager: RtspSourceManager | None = None
+    if isinstance(input_video, str) and input_video.startswith("rtsp://"):
+        rtsp_manager = RtspSourceManager(timeout=5.0)
+        capture = ensure_video_capture(input_video, rtsp_manager)
+    else:
+        capture = ensure_video_capture(input_video)
 
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)

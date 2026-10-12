@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import smtplib
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request as FastAPIRequest, status, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from storage import ALERT_STATUSES, SOURCE_TYPES, RunStore
@@ -36,10 +39,22 @@ class WebhookRequest(BaseModel):
     alert_id: int
 
 
+class EmailNotification(BaseModel):
+    alert_id: int
+    recipient: str = Field(min_length=1, max_length=200)
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1)
+
+
+class NotificationRequest(BaseModel):
+    alert_id: int
+    method: str = Field(default="webhook", pattern="^(webhook|email)$")
+
+
 def create_app(database_path: str | Path = DEFAULT_DATABASE_PATH, api_key: str | None = None) -> FastAPI:
     store = RunStore(database_path)
     configured_api_key = api_key if api_key is not None else os.getenv("RESCUE_EYE_API_KEY")
-    app = FastAPI(title="Rescue-Eye API", version="0.3.0")
+    app = FastAPI(title="Rescue-Eye API", version="0.4.0")
 
     def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         if configured_api_key and x_api_key != configured_api_key:
@@ -107,6 +122,53 @@ def create_app(database_path: str | Path = DEFAULT_DATABASE_PATH, api_key: str |
                 return {"delivered": True, "status_code": response.status, "alert_id": payload.alert_id}
         except (OSError, URLError) as exc:
             raise HTTPException(status_code=502, detail=f"Webhook delivery failed: {exc}") from exc
+
+    @app.post("/api/v1/notifications/email", dependencies=[Depends(require_api_key)])
+    def send_email_notification(payload: EmailNotification) -> dict:
+        alert = next((item for item in store.list_alerts() if item["alert_id"] == payload.alert_id), None)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = f"Rescue-Eye Alert: {alert['severity']} severity"
+            msg["From"] = os.getenv("RESUE_EYE_SMTP_FROM", "rescue-eye@local")
+            msg["To"] = payload.recipient
+            msg.set_content(payload.body)
+            smtp_host = os.getenv("SMTP_HOST", "localhost")
+            smtp_port = int(os.getenv("SMTP_PORT", "25"))
+            smtp_user = os.getenv("SMTP_USER")
+            smtp_password = os.getenv("SMTP_PASSWORD")
+            with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+                if smtp_user and smtp_password:
+                    smtp.login(smtp_user, smtp_password)
+                smtp.send_message(msg)
+            return {"sent": True, "alert_id": payload.alert_id, "recipient": payload.recipient}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Email delivery failed: {exc}") from exc
+
+    @app.websocket("/api/v1/alerts/ws/{alert_id}")
+    async def alert_websocket(websocket: WebSocket, alert_id: int, x_api_key: str = Header(default=None)):
+        if configured_api_key and x_api_key != configured_api_key:
+            await websocket.close(code=4001, reason="Invalid API key")
+            return
+        await websocket.accept()
+        try:
+            alert_data = next(
+                (item for item in store.list_alerts() if item["alert_id"] == alert_id), None
+            )
+            if alert_data is None:
+                await websocket.send_json({"error": "alert_not_found"})
+                await websocket.close()
+                return
+            await websocket.send_json({"type": "initial", "alert": alert_data})
+            while True:
+                data = await websocket.receive()
+                if data.get("type") == "disconnect":
+                    break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await websocket.close()
 
     return app
 
