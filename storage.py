@@ -13,6 +13,8 @@ from geo.geo_mapper import GeoResult
 ALERT_STATUSES = ("NEW", "ACKNOWLEDGED", "ASSIGNED", "RESOLVED", "DISMISSED")
 SOURCE_TYPES = ("local_file", "rtsp", "webcam")
 
+MODEL_VERSIONS = ("yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "custom.pt")
+
 
 class RunStore:
     """Small local SQLite store for Phase 2 runs, observations, and alerts."""
@@ -39,7 +41,9 @@ class RunStore:
                     output_video TEXT NOT NULL,
                     geo_output TEXT NOT NULL,
                     geo_mode TEXT NOT NULL,
-                    summary_json TEXT NOT NULL
+                    summary_json TEXT NOT NULL,
+                    model_version TEXT NOT NULL DEFAULT 'yolov8n.pt',
+                    config_hash TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS sources (
                     source_id TEXT PRIMARY KEY,
@@ -86,6 +90,19 @@ class RunStore:
                     actor TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS benchmarks (
+                    benchmark_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                    model_version TEXT NOT NULL,
+                    dataset_name TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    person_recall REAL,
+                    precision_at_80 REAL,
+                    mAP REAL,
+                    false_alerts_per_hour REAL,
+                    latency_ms REAL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -97,12 +114,20 @@ class RunStore:
         run_id = uuid.uuid4().hex
         timestamp = str(summary.get("timestamp") or self._now())
         results = list(geo_results)
+        # Compute config hash from key pipeline parameters
+        config_input = (
+            str(summary.get("input_video", ""))
+            + str(summary.get("confidence_threshold", 0.35))
+            + str(summary.get("severity_sensitivity", 0.75))
+        )
+        config_hash = hash(config_input) & 0x7fffffff
+        model_version = summary.get("model_version", "yolov8n.pt")
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO runs(run_id, timestamp, input_video, output_video, geo_output, geo_mode, summary_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """ ,
+                INSERT INTO runs(run_id, timestamp, input_video, output_video, geo_output, geo_mode, summary_json, model_version, config_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     run_id,
                     timestamp,
@@ -111,6 +136,8 @@ class RunStore:
                     str(summary.get("geo_output", "")),
                     str(summary.get("geo_mode", "demo")),
                     json.dumps(summary),
+                    model_version,
+                    config_hash,
                 ),
             )
             for result in results:
@@ -160,7 +187,7 @@ class RunStore:
     def list_runs(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT run_id, timestamp, input_video, output_video, geo_output, geo_mode, summary_json FROM runs ORDER BY timestamp DESC"
+                "SELECT run_id, timestamp, input_video, output_video, geo_output, geo_mode, summary_json, model_version, config_hash FROM runs ORDER BY timestamp DESC"
             ).fetchall()
         runs = []
         for row in rows:
